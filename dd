@@ -1,0 +1,177 @@
+import os
+import cv2
+import numpy as np
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+import warnings
+import random
+
+from sklearn.metrics import accuracy_score, confusion_matrix
+from collections import Counter
+
+import tensorflow as tf
+import tensorflow.keras
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Activation, MaxPooling2D, Dropout, Flatten, Reshape, Dense, Conv2D, GlobalAveragePooling2D
+import tensorflow.keras.optimizers as optimizers
+from tensorflow.keras.callbacks import ModelCheckpoint
+from tensorflow.keras.applications import VGG16, VGG19, ResNet50, DenseNet121
+
+from imgaug import augmenters
+
+from tf_keras_vis.saliency import Saliency
+from tf_keras_vis.utils.model_modifiers import ReplaceToLinear
+from tf_keras_vis.utils.scores import CategoricalScore
+
+warnings.filterwarnings('ignore')
+!pip install tf-keras-vis tensorflow > /dev/null
+!wget -q --show-progress 'https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Driver%20Distraction%20Detection/metadata.csv'
+!wget -q --show-progress 'https://storage.googleapis.com/inspirit-ai-data-bucket-1/Data/AI%20Scholars/Sessions%206%20-%2010%20(Projects)/Project%20-%20Driver%20Distraction%20Detection/image_data.npy'
+
+# Labels
+def label_to_numpy(labels):
+    final_labels = np.zeros((len(labels), 4))
+    for i in range(len(labels)):
+        label = labels[i]
+        if label == 'Attentive':
+            final_labels[i,:] = np.array([1, 0, 0, 0])
+        if label == 'DrinkingCoffee':
+            final_labels[i,:] = np.array([0, 1, 0, 0])
+        if label == 'UsingMirror':
+            final_labels[i,:] = np.array([0, 0, 1, 0])
+        if label == 'UsingRadio':
+            final_labels[i,:] = np.array([0, 0, 0, 1])
+    return final_labels
+
+class pkg:
+    def get_metadata(metadata_path, which_splits = ['train', 'test']):
+        metadata = pd.read_csv(metadata_path)
+        metadata = metadata[metadata['split'].isin(which_splits)]
+        classes = ['DrinkingCoffee', 'UsingMirror', 'Attentive', 'UsingRadio']
+      
+      # Create Bins
+      
+        train_dfs = [metadata[(metadata['class'] == c) & (metadata['split'] == 'train')] for c in classes]
+        test_dfs = [metadata[(metadata['class'] == c) & (metadata['split'] == 'test')] for c in classes]
+        num_samples_train = min([df.shape[0] for df in train_dfs])
+        num_samples_test = min([df.shape[0] for df in test_dfs])
+        metadata_train = pd.concat([df.sample(num_samples_train) for df in train_dfs])
+        metadata_test = pd.concat([df.sample(num_samples_test) for df in test_dfs])
+        return pd.concat([metadata_train, metadata_test])
+
+    def get_data_split(split_name, flatten, all_data, metadata, image_shape):
+        classes = ['DrinkingCoffee', 'UsingMirror', 'Attentive', 'UsingRadio']
+        dfs = [metadata[(metadata['class'] == c) & (metadata['split'] == split_name)] for c in classes]
+        num_samples = min([df.shape[0] for df in dfs])
+        metadata_split = pd.concat([df.sample(num_samples) for df in dfs])
+        sub_df = metadata_split
+        index = sub_df['index'].values
+        labels = sub_df['class'].values
+        data = all_data[index,:]
+        if flatten:
+            data = data.reshape([-1, np.product(image_shape)])
+        return data, labels
+
+    def get_train_data(flatten, all_data, metadata, image_shape):
+        return pkg.get_data_split('train', flatten, all_data, metadata, image_shape)
+
+    def get_test_data(flatten, all_data, metadata, image_shape):
+        return pkg.get_data_split('test', flatten, all_data, metadata, image_shape)
+
+class models:
+    def DenseClassifier(hidden_layer_sizes, nn_params, dropout = 0.5):
+        model = Sequential()
+        model.add(Flatten(input_shape = nn_params['input_shape']))
+        for ilayer in hidden_layer_sizes:
+            model.add(Dense(ilayer, activation = 'relu'))
+            if dropout:
+                model.add(Dropout(dropout))
+        model.add(Dense(units = nn_params['output_neurons'], activation = nn_params['output_activation']))
+        model.compile(loss=nn_params['loss'], optimizer=optimizers.SGD(learning_rate=1e-4, momentum=0.95), metrics=['accuracy'])
+        return model
+
+    def CNNClassifier(num_hidden_layers, nn_params, dropout = 0.5):
+        model = Sequential()
+        model.add(Conv2D(32, (3, 3), input_shape=nn_params['input_shape'], padding = 'same'))
+        model.add(Activation('relu'))
+        model.add(MaxPooling2D(pool_size=(2, 2)))
+        for i in range(num_hidden_layers-1):
+            model.add(Conv2D(32, (3, 3), padding = 'same'))
+            model.add(Activation('relu'))
+            model.add(MaxPooling2D(pool_size=(2, 2)))
+        model.add(Flatten())
+        model.add(Dense(units = 128, activation = 'relu'))
+        model.add(Dropout(dropout))
+        model.add(Dense(units = 64, activation = 'relu'))
+        model.add(Dense(units = nn_params['output_neurons'], activation = nn_params['output_activation']))
+        opt = tensorflow.keras.optimizers.RMSprop(learning_rate=1e-4)
+        model.compile(loss=nn_params['loss'], optimizer=opt, metrics=['accuracy'])
+        return model
+
+image_shape = (64, 64, 3)
+nn_params = {
+    'input_shape': image_shape,
+    'output_neurons': 4,
+    'loss': 'categorical_crossentropy',
+    'output_activation': 'softmax'
+}
+
+image_data_path = './image_data.npy'
+metadata_path = './metadata.csv'
+
+_all_data = np.load('image_data.npy')
+_metadata = pkg.get_metadata(metadata_path, ['train','test','field'])
+
+get_train_data  = lambda flatten = False : pkg.get_train_data(flatten = flatten, all_data = _all_data, metadata = _metadata, image_shape = image_shape)
+get_test_data   = lambda flatten = False : pkg.get_test_data(flatten = flatten, all_data = _all_data, metadata = _metadata, image_shape = image_shape)
+
+monitor = ModelCheckpoint('./model.h5', monitor='val_accuracy', verbose=0, save_best_only=True, save_weights_only=False, mode='auto')
+
+X_train, y_train_str = get_train_data(flatten=True)
+X_test, y_test_str = get_test_data(flatten=True)
+X_train = X_train.reshape([-1, 64, 64, 3])
+X_test = X_test.reshape([-1, 64, 64, 3])
+y_train = label_to_numpy(y_train_str)
+y_test = label_to_numpy(y_test_str)
+
+dense = models.DenseClassifier(hidden_layer_sizes = (128,64), nn_params=nn_params)
+cnn = models.CNNClassifier(num_hidden_layers = 5, nn_params=nn_params)
+
+dense.fit(X_train, y_train, epochs = 50, validation_data = (X_test, y_test), shuffle = True, callbacks = [monitor])
+cnn.fit(X_train, y_train, epochs = 50, validation_data = (X_test, y_test), shuffle = True, callbacks = [monitor])
+
+def getImageSamples():
+    image_samples = []
+    image_samples_labels = []
+    idx = random.randint(0, 230)
+    for i in range(4):
+        image_samples.append(X_test[idx])
+        image_samples_labels.append(y_test_str[idx])
+        idx = idx + 230
+    return np.asarray(image_samples), image_samples_labels
+
+def plot_vanilla_saliency_of_a_model(model, X_input, image_titles):
+    score = CategoricalScore(list(range(X_input.shape[0])))
+    saliency = Saliency(model, model_modifier=ReplaceToLinear(), clone=True)
+    saliency_map = saliency(score, X_input)
+    f, ax = plt.subplots(nrows=1, ncols=4, figsize=(12, 4))
+    for i, title in enumerate(image_titles):
+        ax[i].set_title(title, fontsize=16)
+        ax[i].imshow(X_input[i])
+        ax[i].axis('off')
+    plt.tight_layout()
+    plt.show()
+    f, ax = plt.subplots(nrows=1, ncols=4, figsize=(12, 4))
+    for i, title in enumerate(image_titles):
+        ax[i].set_title(title, fontsize=16)
+        ax[i].imshow(saliency_map[i], cmap='jet')
+        ax[i].axis('off')
+    plt.tight_layout()
+    plt.show()
+
+imgs, imgs_labels = getImageSamples()
+plot_vanilla_saliency_of_a_model(cnn, imgs, imgs_labels)
+
+vgg_expert = VGG16(weights = 'imagenet', include_top = False, input_shape = (64, 64, 3))
+vgg
